@@ -12,6 +12,7 @@ def db(): return psycopg.connect(os.environ['DATABASE_URL'])
 def init():
     with db() as c:
         c.execute('CREATE TABLE IF NOT EXISTS nutrition_state (id integer PRIMARY KEY CHECK(id=1), payload jsonb NOT NULL, revision bigint NOT NULL DEFAULT 0)')
+        c.execute('CREATE TABLE IF NOT EXISTS stretching_logs (log_date date NOT NULL, exercise_id smallint NOT NULL CHECK(exercise_id BETWEEN 1 AND 6), completed boolean NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(log_date,exercise_id))')
         c.execute('INSERT INTO nutrition_state(id,payload) VALUES(1,%s) ON CONFLICT DO NOTHING',(Jsonb({'data':[],'targets':[2300,140,300,60]}),))
 @app.get('/login')
 def login(): return redirect('/')
@@ -39,5 +40,35 @@ def state():
         row=c.execute('UPDATE nutrition_state SET payload=%s,revision=revision+1 WHERE id=1 AND revision=%s RETURNING revision',(Jsonb({'data':a,'targets':t}),rev)).fetchone()
     if not row: return jsonify(error='其他裝置已更新，請備份未儲存資料並重新整理'),409
     return jsonify(revision=row[0])
+@app.route('/api/stretching', methods=['GET','PUT','POST'])
+def stretching():
+    if request.method=='GET':
+        with db() as c:
+            rows=c.execute('SELECT log_date,exercise_id,completed FROM stretching_logs ORDER BY log_date,exercise_id').fetchall()
+        logs={}
+        for day,i,done in rows: logs.setdefault(day.isoformat(),[False]*6)[i-1]=done
+        return jsonify(logs=logs,csrf=session.setdefault('csrf',secrets.token_hex(32)))
+    if not hmac.compare_digest(request.headers.get('X-CSRF-Token',''),session.get('csrf','!')): return jsonify(error='CSRF'),403
+    x=request.get_json(silent=True)
+    try:
+        if request.method=='PUT':
+            day=datetime.date.fromisoformat(x['date']); i=x['exercise_id']; done=x['completed']
+            if type(i)!=int or not 1<=i<=6 or type(done)!=bool: raise ValueError()
+            rows=[(day,i,done)]
+        else:
+            logs=x['logs']
+            if not isinstance(logs,dict) or len(logs)>10000: raise ValueError()
+            rows=[]
+            for d,a in logs.items():
+                day=datetime.date.fromisoformat(d)
+                if not isinstance(a,list) or len(a)!=6 or any(type(v)!=bool for v in a): raise ValueError()
+                rows.extend((day,i+1,v) for i,v in enumerate(a))
+    except (TypeError,KeyError,ValueError): return jsonify(error='伸展資料格式錯誤'),400
+    with db() as c:
+        for row in rows:
+            sql='INSERT INTO stretching_logs(log_date,exercise_id,completed) VALUES(%s,%s,%s) ON CONFLICT(log_date,exercise_id) '
+            c.execute(sql+('DO NOTHING' if request.method=='POST' else 'DO UPDATE SET completed=EXCLUDED.completed,updated_at=now()'),row)
+    return jsonify(ok=True)
+
 init()
 if __name__=='__main__': app.run(port=5000)
