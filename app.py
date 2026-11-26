@@ -13,6 +13,7 @@ def init():
     with db() as c:
         c.execute('CREATE TABLE IF NOT EXISTS nutrition_state (id integer PRIMARY KEY CHECK(id=1), payload jsonb NOT NULL, revision bigint NOT NULL DEFAULT 0)')
         c.execute('CREATE TABLE IF NOT EXISTS stretching_logs (log_date date NOT NULL, exercise_id smallint NOT NULL CHECK(exercise_id BETWEEN 1 AND 6), completed boolean NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY(log_date,exercise_id))')
+        c.execute('CREATE TABLE IF NOT EXISTS energy_logs (log_date date PRIMARY KEY, active_calories double precision NOT NULL CHECK(active_calories>=0), resting_calories double precision NOT NULL CHECK(resting_calories>=0), updated_at timestamptz NOT NULL DEFAULT now())')
         c.execute('INSERT INTO nutrition_state(id,payload) VALUES(1,%s) ON CONFLICT DO NOTHING',(Jsonb({'data':[],'targets':[2300,140,300,60]}),))
 @app.get('/login')
 def login(): return redirect('/')
@@ -68,6 +69,25 @@ def stretching():
         for row in rows:
             sql='INSERT INTO stretching_logs(log_date,exercise_id,completed) VALUES(%s,%s,%s) ON CONFLICT(log_date,exercise_id) '
             c.execute(sql+('DO NOTHING' if request.method=='POST' else 'DO UPDATE SET completed=EXCLUDED.completed,updated_at=now()'),row)
+    return jsonify(ok=True)
+
+@app.route('/api/energy', methods=['GET','PUT','POST'])
+def energy():
+    if request.method=='GET':
+        with db() as c:
+            rows=c.execute('SELECT log_date,active_calories,resting_calories FROM energy_logs').fetchall()
+        return jsonify(logs={d.isoformat():[a,r] for d,a,r in rows},csrf=session.setdefault('csrf',secrets.token_hex(32)))
+    if not hmac.compare_digest(request.headers.get('X-CSRF-Token',''),session.get('csrf','!')): return jsonify(error='CSRF'),403
+    try:
+        x=request.get_json(); logs=x['logs']; assert isinstance(logs,dict) and len(logs)<=10000
+        rows=[]
+        for d,v in logs.items():
+            assert isinstance(v,list) and len(v)==2 and all(type(n) in (int,float) and math.isfinite(n) and 0<=n<=100000 for n in v)
+            rows.append((datetime.date.fromisoformat(d),*v))
+    except (TypeError,KeyError,ValueError,AssertionError,OverflowError): return jsonify(error='熱量資料格式錯誤'),400
+    with db() as c:
+        for row in rows:
+            c.execute('INSERT INTO energy_logs(log_date,active_calories,resting_calories) VALUES(%s,%s,%s) ON CONFLICT(log_date) '+('DO NOTHING' if request.method=='POST' else 'DO UPDATE SET active_calories=EXCLUDED.active_calories,resting_calories=EXCLUDED.resting_calories,updated_at=now()'),row)
     return jsonify(ok=True)
 
 init()
